@@ -543,6 +543,90 @@ def cmd_rdp(args: list[str]) -> None:
         print()
 
 
+def cmd_gateway(args: list[str]) -> None:
+    sub = args[0].lower() if args else "show"
+
+    # Escalate before banner so it only prints once
+    if sub in ("set", "del", "delete") and os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
+
+    banner()
+
+    # ── show ───────────────────────────────────────────────────────────────────
+    if sub == "show" or (sub not in ("set", "del", "delete") and not args):
+        result = run(["ip", "route", "show", "default"])
+        lines  = [l for l in result.stdout.splitlines() if l.strip()]
+        if not lines:
+            print(f"  {GRAY}No default gateway configured.{R}\n")
+            hint("Set one:  ethports gateway set <gw> [iface]")
+            print()
+            return
+
+        col_gw, col_if = 20, 20
+        print(f"  {BOLD}{GRAY}{'Gateway':<{col_gw}} {'Interface':<{col_if}} Metric{R}")
+        divider()
+        for line in lines:
+            gw  = re.search(r"via (\S+)", line)
+            dev = re.search(r"dev (\S+)", line)
+            met = re.search(r"metric (\d+)", line)
+            gw_s  = gw.group(1)  if gw  else "—"
+            dev_s = dev.group(1) if dev else "—"
+            met_s = met.group(1) if met else "—"
+            print(f"  {WHITE}{gw_s:<{col_gw}}{R} {CYAN}{BOLD}{dev_s:<{col_if}}{R} {GRAY}{met_s}{R}")
+        print()
+        return
+
+    # ── set ────────────────────────────────────────────────────────────────────
+    if sub == "set":
+        if len(args) < 2:
+            die("Usage: ethports gateway set <gateway> [iface]\n  Example: ethports gateway set 192.168.1.1")
+        gw    = args[1]
+        iface = args[2] if len(args) >= 3 else None
+
+        try:
+            ipaddress.ip_address(gw)
+        except ValueError:
+            die(f"Invalid gateway address: {gw}")
+
+        cmd = ["ip", "route", "replace", "default", "via", gw]
+        if iface:
+            cmd += ["dev", iface]
+
+        step("gateway")
+        label = f"{WHITE}{gw}{R}" + (f" via {WHITE}{iface}{R}" if iface else "")
+        print(f"Setting default gateway {label}...", end="", flush=True)
+        r = run(cmd)
+        if r.returncode == 0:
+            ok()
+            warn("Gateway change is temporary and will be lost on reboot.")
+        else:
+            fail(r.stderr.strip())
+            sys.exit(1)
+        print()
+        return
+
+    # ── del ────────────────────────────────────────────────────────────────────
+    if sub in ("del", "delete"):
+        gw  = args[1] if len(args) >= 2 else None
+        cmd = ["ip", "route", "del", "default"]
+        if gw:
+            cmd += ["via", gw]
+
+        step("gateway")
+        label = f"via {WHITE}{gw}{R}" if gw else f"{WHITE}default route{R}"
+        print(f"Removing {label}...", end="", flush=True)
+        r = run(cmd)
+        if r.returncode == 0:
+            ok()
+        else:
+            fail(r.stderr.strip())
+            sys.exit(1)
+        print()
+        return
+
+    die(f"Unknown gateway subcommand: {sub}\n  Use: show | set | del")
+
+
 def cmd_help(_args: list[str]) -> None:
     banner()
 
@@ -570,6 +654,12 @@ def cmd_help(_args: list[str]) -> None:
     row("ethports scan [iface]",               "ARP scan — find live hosts on subnet")
     print()
 
+    section("Gateway")
+    row("ethports gateway",                    "Show current default gateway(s)")
+    row("ethports gateway set <gw> [iface]",   "Set default gateway")
+    row("ethports gateway del [gw]",           "Remove default gateway")
+    print()
+
     section("Remote Desktop  (RDP → Windows)")
     row("ethports rdp <host>",                 "Open RDP session")
     row("ethports rdp save <name> <host>",     "Save a connection profile")
@@ -590,6 +680,10 @@ def cmd_help(_args: list[str]) -> None:
         ("ethports remove 192.168.1.50/24 enp2s0", "Remove a specific IP"),
         ("ethports flush enp2s0",                  "Wipe all IPs from enp2s0"),
         ("ethports scan enp2s0",                   "Discover devices on the subnet"),
+        ("ethports gateway",                       "Show default gateway"),
+        ("ethports gateway set 192.168.1.1",       "Set gateway (auto-picks interface)"),
+        ("ethports gateway set 10.0.0.1 enp2s0",  "Set gateway on specific interface"),
+        ("ethports gateway del",                   "Remove default gateway"),
         ("ethports rdp 192.168.1.100",             "RDP into a Windows host"),
         ("ethports rdp save office 10.0.0.50",     "Save profile named 'office'"),
         ("ethports rdp office",                    "Connect via saved profile"),
@@ -601,7 +695,7 @@ def cmd_help(_args: list[str]) -> None:
     print(f"  {BOLD}{GRAY}Notes{R}")
     print(f"  {GRAY}{'─' * 54}{R}")
     print(f"  {DIM}• IP changes via add/remove/flush are temporary (lost on reboot).{R}")
-    print(f"  {DIM}• add/remove/flush/up/down require root — ethports escalates automatically.{R}")
+    print(f"  {DIM}• add/remove/flush/up/down/gateway set|del require root — ethports escalates automatically.{R}")
     print(f"  {DIM}• scan requires nmap or arp-scan  (sudo apt install nmap).{R}")
     print(f"  {DIM}• rdp requires xfreerdp           (sudo apt install freerdp2-x11).{R}")
     print()
@@ -612,22 +706,25 @@ def cmd_help(_args: list[str]) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 COMMANDS: dict[str, callable] = {
-    "list":   cmd_list,
-    "add":    cmd_add,
-    "remove": cmd_remove,
-    "rm":     cmd_remove,
-    "flush":  cmd_flush,
-    "up":     cmd_up,
-    "down":   cmd_down,
-    "info":   cmd_info,
-    "scan":   cmd_scan,
-    "rdp":    cmd_rdp,
-    "help":   cmd_help,
-    "--help": cmd_help,
-    "-h":     cmd_help,
+    "list":    cmd_list,
+    "add":     cmd_add,
+    "remove":  cmd_remove,
+    "rm":      cmd_remove,
+    "flush":   cmd_flush,
+    "up":      cmd_up,
+    "down":    cmd_down,
+    "info":    cmd_info,
+    "scan":    cmd_scan,
+    "gateway": cmd_gateway,
+    "gw":      cmd_gateway,
+    "rdp":     cmd_rdp,
+    "help":    cmd_help,
+    "--help":  cmd_help,
+    "-h":      cmd_help,
 }
 
 PRIVILEGED = {"add", "remove", "rm", "flush", "up", "down"}
+# gateway handles its own escalation internally (only set/del need root)
 
 
 def main() -> None:

@@ -160,6 +160,60 @@ def validate_cidr(cidr: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# NetworkManager persistence helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def nm_get_connection(iface: str) -> str | None:
+    """Return the NM connection name bound to iface, or None."""
+    r = run(["nmcli", "-t", "-f", "NAME,DEVICE", "connection", "show"])
+    for line in r.stdout.splitlines():
+        name, _, dev = line.partition(":")
+        if dev.strip() == iface:
+            return name.strip()
+    return None
+
+
+def nm_add_address(cidr: str, iface: str) -> tuple[bool, str]:
+    """Persist cidr on iface via NetworkManager. Returns (ok, error_msg)."""
+    conn = nm_get_connection(iface)
+    if not conn:
+        return False, f"No NetworkManager connection found for {iface}"
+
+    r = run(["nmcli", "connection", "modify", conn, "+ipv4.addresses", cidr])
+    if r.returncode != 0:
+        return False, r.stderr.strip()
+
+    run(["nmcli", "connection", "up", conn])
+    return True, ""
+
+
+def nm_remove_address(cidr: str, iface: str) -> tuple[bool, str]:
+    """Remove persisted cidr from iface via NetworkManager. Returns (ok, error_msg)."""
+    conn = nm_get_connection(iface)
+    if not conn:
+        return False, f"No NetworkManager connection found for {iface}"
+
+    r = run(["nmcli", "connection", "modify", conn, "-ipv4.addresses", cidr])
+    if r.returncode != 0:
+        return False, r.stderr.strip()
+
+    run(["nmcli", "connection", "up", conn])
+    return True, ""
+
+
+def nm_list_addresses(iface: str) -> list[str]:
+    """Return list of persisted IPs on iface from NetworkManager."""
+    conn = nm_get_connection(iface)
+    if not conn:
+        return []
+    r = run(["nmcli", "-g", "ipv4.addresses", "connection", "show", conn])
+    raw = r.stdout.strip()
+    if not raw or raw == "--":
+        return []
+    return [a.strip() for a in raw.split(",") if a.strip()]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # RDP profile store
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -192,19 +246,38 @@ def cmd_list(_args: list[str]) -> None:
     print(f"  {BOLD}{GRAY}{'Interface':<{col_i}} {'State':<10} {'MAC':<{col_m}} IPs{R}")
     divider()
     for iface in ifaces:
-        state  = get_iface_state(iface)
-        mac    = get_iface_mac(iface)
-        ips    = get_iface_ips(iface)
-        sl     = state_label(state)
-        ip_str = f"{WHITE}{', '.join(ips)}{R}" if ips else f"{GRAY}(no IPs){R}"
+        state       = get_iface_state(iface)
+        mac         = get_iface_mac(iface)
+        runtime_ips = get_iface_ips(iface)
+        persist_ips = nm_list_addresses(iface)
+        sl          = state_label(state)
+
+        # Tag each runtime IP as (P) if it is also persisted
+        tagged = []
+        for ip in runtime_ips:
+            tag = f" {GREEN}(P){R}" if ip in persist_ips else ""
+            tagged.append(f"{WHITE}{ip}{R}{tag}")
+
+        # Show persisted IPs not yet active in runtime
+        for ip in persist_ips:
+            if ip not in runtime_ips:
+                tagged.append(f"{GRAY}{ip} (persisted, not active){R}")
+
+        ip_str = ", ".join(tagged) if tagged else f"{GRAY}(no IPs){R}"
         print(f"  {CYAN}{BOLD}{iface:<{col_i}}{R} {sl:<18} {WHITE}{mac:<{col_m}}{R} {ip_str}")
+
+    print()
+    hint("(P) = saved in NetworkManager — survives reboot")
     print()
 
 
 def cmd_add(args: list[str]) -> None:
     banner()
+    persist = "--persist" in args
+    args    = [a for a in args if a != "--persist"]
+
     if not args:
-        die("Usage: ethports add <ip/prefix> [iface]\n  Example: ethports add 192.168.1.50/24")
+        die("Usage: ethports add <ip/prefix> [iface] [--persist]\n  Example: ethports add 192.168.1.50/24 --persist")
 
     cidr = args[0]
     if not validate_cidr(cidr):
@@ -218,23 +291,38 @@ def cmd_add(args: list[str]) -> None:
     else:
         iface = pick_iface(ifaces, "Add IP to")
 
-    step("add")
-    print(f"{WHITE}{cidr}{R} → {WHITE}{iface}{R}...", end="", flush=True)
-    r = run(["ip", "addr", "add", cidr, "dev", iface])
-    if r.returncode == 0:
-        ok()
-        warn("IP is temporary and will be lost on reboot.")
-        hint("For persistence: configure NetworkManager or netplan.")
+    if persist:
+        # ── Permanent via NetworkManager ──────────────────────────────────────
+        step("persist")
+        print(f"{WHITE}{cidr}{R} → {WHITE}{iface}{R} (permanent)...", end="", flush=True)
+        ok_, msg = nm_add_address(cidr, iface)
+        if ok_:
+            ok()
+            hint("IP saved to NetworkManager — survives reboot.")
+        else:
+            fail(msg)
+            sys.exit(1)
     else:
-        fail(r.stderr.strip())
-        sys.exit(1)
+        # ── Temporary via ip addr ─────────────────────────────────────────────
+        step("add")
+        print(f"{WHITE}{cidr}{R} → {WHITE}{iface}{R}...", end="", flush=True)
+        r = run(["ip", "addr", "add", cidr, "dev", iface])
+        if r.returncode == 0:
+            ok()
+            warn("Temporary — lost on reboot.  Use --persist to make it permanent.")
+        else:
+            fail(r.stderr.strip())
+            sys.exit(1)
     print()
 
 
 def cmd_remove(args: list[str]) -> None:
     banner()
+    persist = "--persist" in args
+    args    = [a for a in args if a != "--persist"]
+
     if not args:
-        die("Usage: ethports remove <ip/prefix> [iface]\n  Example: ethports remove 192.168.1.50/24")
+        die("Usage: ethports remove <ip/prefix> [iface] [--persist]\n  Example: ethports remove 192.168.1.50/24 --persist")
 
     cidr = args[0]
     if not validate_cidr(cidr):
@@ -248,14 +336,28 @@ def cmd_remove(args: list[str]) -> None:
     else:
         iface = pick_iface(ifaces, "Remove from")
 
-    step("remove")
-    print(f"{WHITE}{cidr}{R} from {WHITE}{iface}{R}...", end="", flush=True)
-    r = run(["ip", "addr", "del", cidr, "dev", iface])
-    if r.returncode == 0:
-        ok()
+    if persist:
+        # ── Remove from NetworkManager profile ────────────────────────────────
+        step("persist")
+        print(f"Removing {WHITE}{cidr}{R} from {WHITE}{iface}{R} (permanent)...", end="", flush=True)
+        ok_, msg = nm_remove_address(cidr, iface)
+        if ok_:
+            ok()
+            hint("Removed from NetworkManager — will not return after reboot.")
+        else:
+            fail(msg)
+            sys.exit(1)
     else:
-        fail(r.stderr.strip())
-        sys.exit(1)
+        # ── Remove from runtime only ──────────────────────────────────────────
+        step("remove")
+        print(f"{WHITE}{cidr}{R} from {WHITE}{iface}{R}...", end="", flush=True)
+        r = run(["ip", "addr", "del", cidr, "dev", iface])
+        if r.returncode == 0:
+            ok()
+            hint("Removed from runtime only. If this was a persisted IP, also run --persist to remove it from NM.")
+        else:
+            fail(r.stderr.strip())
+            sys.exit(1)
     print()
 
 
@@ -638,10 +740,12 @@ def cmd_help(_args: list[str]) -> None:
         print(f"  {WHITE}{cmd:<38}{R} {GRAY}{desc}{R}")
 
     section("IP Management")
-    row("ethports list",                       "All interfaces: state, MAC, IPs")
-    row("ethports add <ip/prefix> [iface]",    "Add IPv4 address")
-    row("ethports remove <ip/prefix> [iface]", "Remove IPv4 address  (alias: rm)")
-    row("ethports flush [iface]",              "Remove all IPs from an interface")
+    row("ethports list",                                "All interfaces: state, MAC, IPs  (P) = persisted")
+    row("ethports add <ip/prefix> [iface]",             "Add IPv4  (temporary — lost on reboot)")
+    row("ethports add <ip/prefix> [iface] --persist",   "Add IPv4  (permanent — survives reboot)")
+    row("ethports remove <ip/prefix> [iface]",          "Remove IPv4 from runtime  (alias: rm)")
+    row("ethports remove <ip/prefix> [iface] --persist","Remove IPv4 from NetworkManager permanently")
+    row("ethports flush [iface]",                       "Remove all runtime IPs from an interface")
     print()
 
     section("Interface Control")
@@ -694,10 +798,29 @@ def cmd_help(_args: list[str]) -> None:
 
     print(f"  {BOLD}{GRAY}Notes{R}")
     print(f"  {GRAY}{'─' * 54}{R}")
-    print(f"  {DIM}• IP changes via add/remove/flush are temporary (lost on reboot).{R}")
+    print(f"  {DIM}• add without --persist is temporary (lost on reboot).{R}")
+    print(f"  {DIM}• add --persist saves to NetworkManager — survives reboot.{R}")
     print(f"  {DIM}• add/remove/flush/up/down/gateway set|del require root — ethports escalates automatically.{R}")
     print(f"  {DIM}• scan requires nmap or arp-scan  (sudo apt install nmap).{R}")
     print(f"  {DIM}• rdp requires xfreerdp           (sudo apt install freerdp2-x11).{R}")
+    print()
+
+    section("Subnet Mask Quick Reference")
+    masks = [
+        ("/8",  "255.0.0.0",       "16,777,214", "Large private network  e.g. 10.x.x.x"),
+        ("/16", "255.255.0.0",     "65,534",     "Medium network         e.g. 192.168.x.x"),
+        ("/24", "255.255.255.0",   "254",        "Home / office LAN  ← most common"),
+        ("/25", "255.255.255.128", "126",        "Split a /24 in half"),
+        ("/26", "255.255.255.192", "62",         "Small segment"),
+        ("/28", "255.255.255.240", "14",         "Very small segment"),
+        ("/30", "255.255.255.252", "2",          "Point-to-point link"),
+        ("/32", "255.255.255.255", "1",          "Single host / loopback"),
+    ]
+    print(f"  {BOLD}{GRAY}  {'Prefix':<8} {'Windows Mask':<20} {'Hosts':<12} Notes{R}")
+    print(f"  {GRAY}{'─' * 66}{R}")
+    for prefix, mask, hosts, note in masks:
+        highlight = BOLD + GREEN if prefix == "/24" else WHITE
+        print(f"  {CYAN}{BOLD}{prefix:<8}{R} {highlight}{mask:<20}{R} {WHITE}{hosts:<12}{R} {GRAY}{note}{R}")
     print()
 
 

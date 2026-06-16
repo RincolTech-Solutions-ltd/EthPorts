@@ -1,0 +1,23 @@
+name: Sync to RincolTech
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to RincolTech mirror
+        run: |
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${{ github.ref_name }}"
+          git remote add rincol "https://x-access-token:${{ secrets.RINCOL_SYNC_TOKEN }}@github.com/RincolTech-Solutions-ltd/${REPO_NAME}.git"
+          git push rincol "HEAD:${BRANCH}" --force
